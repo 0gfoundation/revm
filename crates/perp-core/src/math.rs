@@ -303,10 +303,12 @@ pub fn mark_band_bounds(mark: u64, price_band_bps: u32) -> (u128, u128) {
 /// winner pays `maxPrice`, and the gap up to the loser's own price is the loser's shortfall,
 /// absorbed by the insurance fund — as a cross ADL leaves what the band's edge does not transfer.
 ///
-/// ⚠️ A cross ADL at the MARK (the account still solvent, or a leg unpriced) is clamped by neither,
-/// so between an `updateMarket` that lowers `maxPrice` under the stored mark and the next oracle
-/// update it fills at that stored mark, above `maxPrice`; an isolated one there is held at
-/// `maxPrice`.
+/// A cross ADL at the MARK (the account still solvent, or a leg unpriced) does not go through this
+/// band either, and between an `updateMarket` that lowers `maxPrice` under the stored mark and the
+/// next oracle update that mark sits above `maxPrice`. It is held at `maxPrice` the same way (owner
+/// decision 2026-11-19, `risk::adl::run_adl`): a long loser sells there and the gap stays in its
+/// cross wallet — the receivable the band's edge leaves, cleared by the insurance fund once the
+/// account holds no position. So no fill of any kind, book or ADL, executes above `maxPrice`.
 #[inline]
 pub fn market_band_bounds(market: &Market) -> (u128, u128) {
     let (upper, lower) = mark_band_bounds(market.mark_price, market.price_band_bps);
@@ -336,10 +338,10 @@ pub fn position_value_fits_i64(
 /// an open position that would break it. Every price a position is later valued or filled at is
 /// at or below that ceiling: the mark is clamped to `maxPrice` on each oracle update (the `max`
 /// covers the stored mark an `updateMarket` that LOWERS `maxPrice` leaves above it until the next
-/// update), no book fill and no ISOLATED ADL fill executes above `maxPrice`, and a cross ADL fill
-/// executes in the band or at the mark ([`market_band_bounds`]). So no valuation of a position's
-/// NOTIONAL — at the mark, or as the summed closing value of a liquidation that takes it through
-/// the book in one pass — can leave the `i64` range the sweep would otherwise halt on.
+/// update), and no fill — book or ADL, isolated or cross — executes above `maxPrice`
+/// ([`market_band_bounds`]). So no valuation of a position's NOTIONAL — at the mark, or as the
+/// summed closing value of a liquidation that takes it through the book in one pass — can leave
+/// the `i64` range the sweep would otherwise halt on.
 ///
 /// What it does NOT bound (second-round review): the position's MARGIN, so its equity — added
 /// margin or a funding credit can take `notional + vQuote + margin` past `i64` (the maintenance

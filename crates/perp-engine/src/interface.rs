@@ -731,18 +731,23 @@ sol! {
         /// trade there, and a bid above it is expired at the next oracle tick (or at a
         /// `drainDeferredWork`, when the market already has deferred work: `OrderCancelled` reason
         /// 4) — and the stored mark stays where it was until the next `updateIndexPrice` clamps
-        /// it. An ISOLATED liquidation's ADL fill is held at or below `maxPrice` too (owner
-        /// decision 2026-11-19): it executes at `min(its price, maxPrice)` — the mark while the
-        /// position still has equity there, its bankruptcy price otherwise — so a long whose
-        /// bankruptcy price a lowering left above `maxPrice` is ADL'd AT `maxPrice`, its winner pays
-        /// no more, and the gap is the liquidated position's bad debt (`InsuranceFundChanged`, and
-        /// `InsuranceFundDepleted` for what the fund cannot cover). A cross liquidation's ADL at
-        /// the account's bankruptcy price is clamped into the price band, whose upper edge is
-        /// `maxPrice`; one at the MARK (the account still solvent) executes at the stored mark,
-        /// which until the next `updateIndexPrice` can sit above a lowered `maxPrice`. A lowering
-        /// bounds what a position may grow to, not the entry value it already carries: an opening
-        /// fill that would take that past `int64` is refused (a resting order cancelled,
-        /// `OrderCancelled` reason 2).
+        /// it. An ADL fill — ISOLATED or CROSSED — is held at or below `maxPrice` too (owner
+        /// decisions 2026-11-19): it executes at `min(its price, maxPrice)`. An isolated position's
+        /// price is the mark while it still has equity there, its bankruptcy price otherwise, so a
+        /// long whose bankruptcy price a lowering left above `maxPrice` is ADL'd AT `maxPrice`, its
+        /// winner pays no more, and the gap is the liquidated position's bad debt
+        /// (`InsuranceFundChanged`, and `InsuranceFundDepleted` for what the fund cannot cover). A
+        /// cross account's is the stored mark while its `crossMarginBalance >= 0` (or a leg is
+        /// unpriced), its bankruptcy price clamped into the price band (upper edge `maxPrice`)
+        /// otherwise; at a stored mark above a lowered `maxPrice` a long sells at `maxPrice`, and
+        /// what that leaves its account short stays in its cross wallet like any cross deficit —
+        /// its other cross legs close off it, and the insurance fund clears what is left once it
+        /// holds no position. Either way a winner that cannot absorb a sale at
+        /// `maxPrice` (an isolated long whose equity there is below zero, a cross account whose
+        /// balance cannot carry the move from the mark) is filled only after every holder that
+        /// can, the fund taking its shortfall. A lowering bounds what a position may grow to, not
+        /// the entry value it already carries: an opening fill that would take that past `int64`
+        /// is refused (a resting order cancelled, `OrderCancelled` reason 2).
         function updateMarket(uint64 marketId, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval, bool active, uint64 fundingInterval, int64 interestRate, uint32 liquidationFeeRateBps, uint32 priceBandBps) external;
         /// Read the current mark price for a market.
         function getMarkPrice(uint64 marketId) external view returns (uint64 price);
@@ -2022,8 +2027,10 @@ sol! {
         /// `liquidate: account is above cross maintenance margin` (no write); below it the call
         /// runs the account's liquidation episode starting at `marketId` — cancel every open order
         /// of the account, close its cross markets one by one (this one first) until it is back at
-        /// maintenance, ADL what the book does not take — within a 16-step budget, the rest left to
-        /// the next tick (`CrossLiquidationStarted` / `Liquidation` / `CrossLiquidationEnded`). A
+        /// maintenance, ADL what the book does not take (at the stored mark or the account's
+        /// bankruptcy price, either held at `maxPrice` — see `Adl`) — within a 16-step budget, the
+        /// rest left to the next tick (`CrossLiquidationStarted` / `Liquidation` /
+        /// `CrossLiquidationEnded`). A
         /// close stopped by the 128-maker cap after filling something is not ADL'd either: the
         /// episode stops at that market, flags it for `drainDeferredWork`, and resumes there
         /// against the book. An
@@ -2936,15 +2943,20 @@ sol! {
         // MARK for a solvent residual — an isolated position with equity left, a cross account
         // with `crossMarginBalance ≥ 0`, or a cross account any of whose cross legs is unpriced
         // (stale or mark 0) — else the bankruptcy price: the isolated position's own, or (cross
-        // P3) the account's MM-share bankruptcy price clamped into the market's band. An ISOLATED
-        // residual's price is held at the market's `maxPrice` (owner decision 2026-11-19): a long
-        // whose own price is above it fills at `maxPrice`, and what that leaves it short is bad
-        // debt for the insurance fund (`InsuranceFundChanged` / `InsuranceFundDepleted`), not the
-        // winner's to pay. When one pass ADLs only part of such a long (the per-update ADL budget,
-        // or no holder left), each filled slice's gap is first drawn from the rest's own margin, as
-        // on every isolated close, so the rest's bankruptcy price rises (up to its entry): at the
-        // next pass it fills at `maxPrice` again, unless `maxPrice` was raised in between — then at
-        // that higher bankruptcy price, which its winners pay. `qty` = deleveraged size.
+        // P3) the account's MM-share bankruptcy price clamped into the market's band. Every ADL
+        // price, ISOLATED or CROSSED, is held at the market's `maxPrice` (owner decisions
+        // 2026-11-19), so `price <= maxPrice` always. An ISOLATED long whose own price is above it
+        // fills at `maxPrice`, and what that leaves it short is bad debt for the insurance fund
+        // (`InsuranceFundChanged` / `InsuranceFundDepleted`), not the winner's to pay. A CROSSED
+        // residual is held there only at a stored mark above a just-lowered `maxPrice` (its
+        // bankruptcy price is in the band already): a long's shortfall stays in its cross wallet
+        // like any cross deficit, the insurance fund clearing what is left once the account holds
+        // no position (`AccountBalanceChanged` reason 7). When one pass ADLs only part
+        // of an isolated long held at `maxPrice` (the per-update ADL budget, or no holder left),
+        // each filled slice's gap is first drawn from the rest's own margin, as on every isolated
+        // close, so the rest's bankruptcy price rises (up to its entry): at the next pass it fills
+        // at `maxPrice` again, unless `maxPrice` was raised in between — then at that higher
+        // bankruptcy price, which its winners pay. `qty` = deleveraged size.
         event Adl(address indexed liquidatedUser, address indexed adlUser, uint64 indexed marketId, uint64 qty, uint64 price);
 
         // Feeds: market metadata bootstrap for indexer
