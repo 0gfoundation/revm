@@ -2951,7 +2951,11 @@ sol! {
         // residual is held there only at a stored mark above a just-lowered `maxPrice` (its
         // bankruptcy price is in the band already): a long's shortfall stays in its cross wallet
         // like any cross deficit, the insurance fund clearing what is left once the account holds
-        // no position (`AccountBalanceChanged` reason 7). When one pass ADLs only part
+        // no position (`AccountBalanceChanged` reason 7). When one pass ADLs only part of such a
+        // CROSSED long, the next pass prices that deficit into the rest like any cross deficit:
+        // at its bankruptcy price clamped into the band — `maxPrice` again while the window
+        // lasts, above the mark (up to the band's edge) after a raise, which the rest's winners
+        // pay. When one pass ADLs only part
         // of an isolated long held at `maxPrice` (the per-update ADL budget, or no holder left),
         // each filled slice's gap is first drawn from the rest's own margin, as on every isolated
         // close, so the rest's bankruptcy price rises (up to its entry): at the next pass it fills

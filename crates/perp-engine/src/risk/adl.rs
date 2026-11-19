@@ -88,7 +88,9 @@ use crate::{
 /// clamped into the market's band otherwise (the deficit the band's edge does not transfer stays
 /// in the loser's wallet) — and, like every ADL price, held at `maxPrice` here
 /// ([`held_at_max_price`]). Its leg settles into its cross wallet like any cross fill; the episode
-/// charges the clearance fee on what this closed.
+/// charges the clearance fee on what this closed. A long's gap at `maxPrice` waits in that wallet
+/// for the route every cross deficit takes — a later pass of this same leg included, when this one
+/// is cut short (see the body).
 pub(crate) fn run_adl<H: PerpHost>(
     context: &mut H,
     loser: Address,
@@ -132,7 +134,18 @@ pub(crate) fn run_adl<H: PerpHost>(
         //     edge already leaves (R5) — the episode's next cross legs close at MM-share bankruptcy
         //     prices off that `E`, its isolated silos net it as they close, and once it holds no
         //     position the insurance fund clears the rest (Q8, `risk::negative_balance`). No new
-        //     route, and no bad debt reported here;
+        //     route, and no bad debt reported here.
+        //     ⚠️ That route includes a LATER PASS OF THIS SAME LEG. An ADL cut short (the call's
+        //     ADL budget spent, or no holder left) leaves the rest open and the filled slices' gap
+        //     in the wallet; once that gap has taken `E` under zero, the next pass (the drain, a
+        //     tick, `liquidate()`) fills the rest at its MM-share bankruptcy price clamped into the
+        //     band in force THEN.
+        //     While the window lasts that is `maxPrice` again, and the fund clears the gap (Q8).
+        //     After an `updateMarket` that raised `maxPrice`, the rest's winners pay above the mark,
+        //     up to the band's edge, for the windfall the first winners took at `maxPrice` — the
+        //     cross twin of D2-continuation-1 (`isolated_adl_price`), pinned by
+        //     `tests::cross_liquidation::adl_max_price`. It follows from reusing the route: booking
+        //     the cap's gap to the fund at once would be a new deficit route;
         //   * a SHORT loser buys back at `maxPrice`, below the mark: its account keeps the
         //     difference;
         //   * the WINNERS are screened at this price like at any other (`eq_fill`; a CROSSED one's
