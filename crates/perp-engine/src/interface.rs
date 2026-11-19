@@ -2936,7 +2936,11 @@ sol! {
         // residual's price is held at the market's `maxPrice` (owner decision 2026-11-19): a long
         // whose own price is above it fills at `maxPrice`, and what that leaves it short is bad
         // debt for the insurance fund (`InsuranceFundChanged` / `InsuranceFundDepleted`), not the
-        // winner's to pay. `qty` = deleveraged size.
+        // winner's to pay. When one pass ADLs only part of such a long (the per-update ADL budget,
+        // or no holder left), each filled slice's gap is first drawn from the rest's own margin, as
+        // on every isolated close, so the rest's bankruptcy price rises (up to its entry): at the
+        // next pass it fills at `maxPrice` again, unless `maxPrice` was raised in between — then at
+        // that higher bankruptcy price, which its winners pay. `qty` = deleveraged size.
         event Adl(address indexed liquidatedUser, address indexed adlUser, uint64 indexed marketId, uint64 qty, uint64 price);
 
         // Feeds: market metadata bootstrap for indexer

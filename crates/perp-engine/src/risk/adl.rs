@@ -262,6 +262,17 @@ fn isolated_adl_price(
     // cannot cover). Before the cap the winner absorbed that gap by paying `p_b` (second-round review
     // band-iso-adl-4). Decided here, before `run_adl_fills` writes anything; every winner's screening
     // (`eq_fill`, a CROSSED winner's slippage) then judges it at this capped price.
+    //
+    // ⚠️ An ADL CUT SHORT (the update's ADL budget spent, or no holder left to take the rest): like
+    // every isolated close, each filled slice's gap is drawn from the REST's silo first
+    // (`apply_position_fill`) and only what that cannot cover is bad debt, so the fund takes less in
+    // this pass and the rest is left with less than its pro-rata silo — a higher `p_b`, up to its
+    // entry price. While the cap still binds at the next pass the rest fills at `maxPrice` again and
+    // the fund's total is the same `(p_b − maxPrice) × qty`. If `updateMarket` RAISES `maxPrice` in
+    // between, the rest fills at its own raised `p_b` and ITS winners pay the gap its silo covered —
+    // above the original `p_b`, though never above the `maxPrice` in force (third-round review
+    // D2-continuation-1; `tests::adl_max_price`, pinned as is: booking each capped slice's gap as bad
+    // debt at once would be a new deficit route, an owner decision).
     if fill_price > max_price {
         if loser_pos.amount > 0 {
             loser_policy = BadDebtPolicy::LoserOnly;
@@ -899,7 +910,8 @@ enum BadDebtPolicy {
     /// below `calc_value(1, take)` in the first case, `|credit|` pro rata plus that dust in the
     /// second. And an ISOLATED LONG whose price was held at `maxPrice` (`isolated_adl_price`): what
     /// selling there instead of at its own price leaves it short — `(p_b − maxPrice) × take` for an
-    /// insolvent one. The WINNER is still held to zero bad debt.
+    /// insolvent one, less what the rest's silo covers when the fill closes only part of it
+    /// (`apply_position_fill`). The WINNER is still held to zero bad debt.
     LoserOnly,
     /// Last resort, and only against a counterparty that is ALREADY bankrupt at the mark. See
     /// `run_adl`'s fallback tier for why that restriction is the whole argument.
