@@ -1886,13 +1886,9 @@ fn frz_the_minus_2023_matrix_of_a_flagged_account() {
 /// (leverage 10, $19,000 at entry: inside the first bracket) is carried by the mark into the 15 %
 /// bracket: `MM = $5,125 > PIM = $4,750`. A maker loss on M1 (never margin-checked, Q9) leaves
 /// `E = $4,925` — under maintenance, yet `A = $175 ≥ 0`, so the available-balance gate alone would
-/// admit an opening bid costing $90 of IM. R2 refuses it, and an isolated opening order of the
+/// admit an opening bid costing $150 of IM. R2 refuses it, and an isolated opening order of the
 /// same account; a reduce-only order rests. At `E = ΣMM` exactly (a $200 deposit) the bid rests; a
 /// bid ABOVE the mark carries its Open Loss and is refused again.
-///
-/// The opening bids are in M3 (`T10`, mark $1,000): an opening bid in M5 never reaches R2 — the
-/// position the bracket move left there is past the 5x cap for ALICE's stored 10x, so it is
-/// refused by the tier guard of its fill, now checked at rest.
 #[test]
 fn rest_an_opening_order_rests_only_at_cross_maintenance() {
     let mut w = std_world();
@@ -1908,8 +1904,7 @@ fn rest_an_opening_order_rests_only_at_cross_maintenance() {
     let v = w.account_view(ALICE);
     assert_eq!(v.availableBalance as i128, d(175), "A ≥ 0 under maintenance");
 
-    w.rejected(ALICE, &gtc(M5, BUY, 1_500, 1), TIER_REJECT);
-    w.rejected(ALICE, &gtc(M3, BUY, 900, 1), E_J1);
+    w.rejected(ALICE, &gtc(M5, BUY, 1_500, 1), E_J1);
     w.ok(ALICE, &gtc_ro(M5, SELL, 2_600, 1));
     w.set_type(ALICE, M2, ISOLATED);
     w.rejected(ALICE, &gtc(M2, BUY, 900, 1), E_J1);
@@ -1918,15 +1913,11 @@ fn rest_an_opening_order_rests_only_at_cross_maintenance() {
     w.ok(ALICE, &transferToPerpCall { amount: d(200) as u64 }.abi_encode());
     let a = w.acct(ALICE);
     assert_eq!(a.e, a.cmm, "E = ΣMM: healthy (the `≥` rule)");
-    let bid = w.rest(ALICE, M3, BUY, 900, 1);
-    w.ok(ALICE, &cancelOrderCall { orderId: bid.into(), marketId: M3 }.abi_encode());
+    let bid = w.rest(ALICE, M5, BUY, 1_500, 1);
+    w.ok(ALICE, &cancelOrderCall { orderId: bid.into(), marketId: M5 }.abi_encode());
     // $10 of Open Loss above the mark.
-    w.rejected(ALICE, &gtc(M3, BUY, 1_010, 1), E_J1);
-    w.rejected(ALICE, &gtc(M5, BUY, 1_500, 1), TIER_REJECT);
+    w.rejected(ALICE, &gtc(M5, BUY, 2_510, 1), E_J1);
 }
-
-/// The per-open tier guard's refusal (`trading::TIER_LEVERAGE_REJECT`).
-const TIER_REJECT: &str = "placeOrder: leverage exceeds the margin tier for this position size";
 
 // ═════════════════════════════════════════════════════════════════════════════════════════════
 // ADL (R5, D7)

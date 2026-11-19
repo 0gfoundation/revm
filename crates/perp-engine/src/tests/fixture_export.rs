@@ -2585,8 +2585,7 @@ fn fixture_export_isolated_random_m2() {
 ///   loser's address below the winner's and once above, since the end-of-call drain publishes
 ///   their reason-7 rows in address order;
 /// * a CROSSED maker refused on a wallet the fund has cleared to 0 (no cash at hand), and a maker
-///   refused because the fill would carry its leverage past its tier (both reason 2) — its bid
-///   fitted the tier when it rested, and a taker fill of its own grew the position since.
+///   refused because the fill would carry its leverage past its tier (both reason 2).
 mod cross_scenes {
     use super::*;
 
@@ -2797,18 +2796,11 @@ mod cross_scenes {
         assert_eq!(r.view(&getPositionCall { user: C, marketId: M21 }).amount, 0);
 
         // ── A maker whose fill would carry its leverage past its tier: refused (2) ──
-        //
-        // An opening order is held to the tier guard of its fill when it RESTS, so D's bid of 40
-        // ($4,000 at 20x, under the $5k boundary) must fit when placed. D then buys 20 as a taker,
-        // and the bid's fill would take D to 60 — $6,000, the 5x tier, under its 20x: refused when
-        // LP's sell meets it, and LP's remainder expires.
         r.next_block(T0 + 90);
-        r.ok(D, &limit(M22, BUY, px(100), 40, 0));
-        r.ok(LP, &limit(M22, SELL, px(101), 20, 0));
-        r.ok(D, &market(M22, BUY, 20));
-        r.ok(LP, &market(M22, SELL, 40));
+        r.ok(D, &limit(M22, BUY, px(100), 80, 0));
+        r.ok(LP, &market(M22, SELL, 80));
         let d = r.view(&getPositionCall { user: D, marketId: M22 });
-        assert_eq!(d.amount, 20, "D's bid was refused, not filled");
+        assert_eq!(d.amount, 0, "D's bid was refused, not filled");
         r.checkpoint("end");
         rec
     }
