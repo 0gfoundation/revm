@@ -155,7 +155,9 @@ pub(crate) fn run_adl<H: PerpHost>(
         //     cover). A LONG winner sells below it: one whose equity at `maxPrice` is short of zero
         //     (an entry above it on a thin silo) — or, CROSSED, whose `E` cannot carry the
         //     slippage — is fallback tier, filled only once every clean holder is spent, its
-        //     shortfall the fund's like any fallback winner's (`adl_fill`).
+        //     shortfall the fund's like any fallback winner's (`adl_fill`): an ISOLATED one's past
+        //     its WHOLE silo (a fill of only part of it draws the slice's gap from the rest's silo
+        //     first, `apply_position_fill`), a CROSSED one's past `min(E, 0)`.
         //
         // Decided here, before `run_adl_fills` writes anything.
         let Some(p) = cross_fill_price else {
@@ -478,10 +480,14 @@ fn run_adl_fills<H: PerpHost>(
             // with the trade-off understood, to be revisited.
             //
             // This holder is SOLVENT at the mark: nobody would liquidate it, and the ADL price is
-            // a HAIRCUT (an insolvent long's `p_b` sits ABOVE the mark, and a short's equity falls
-            // as price rises), so conscripting it manufactures fund exposure that would not
-            // otherwise exist, at the expense of someone who is not bankrupt. That is a real cost
-            // and it is not being denied here.
+            // a HAIRCUT — off the mark against it. Against an insolvent LONG the price is its
+            // `p_b`, ABOVE the mark, and a short's equity falls as price rises. Against a SHORT
+            // whose price `maxPrice` holds BELOW the mark (the window after an `updateMarket` that
+            // lowered it, ISOLATED or CROSSED alike — `held_at_max_price`), a LONG holder sells
+            // below the mark, and one whose entry is above `maxPrice` on a thin silo is short
+            // there. So conscripting it manufactures fund exposure that would not otherwise exist,
+            // at the expense of someone who is not bankrupt. That is a real cost and it is not
+            // being denied here.
             //
             // It buys the property that ADL now essentially CANNOT fail: `Σ amount == 0` holds
             // inside a market (every `apply_position_fill` call site is two-sided), so opposite
@@ -490,12 +496,19 @@ fn run_adl_fills<H: PerpHost>(
             // accumulating in the registry, which is what was burning liquidation slots and
             // re-arming `deferred_work` every tick.
             //
-            // ⚠️ Note for whoever revisits this: there is NO "charge the fund only for the part
-            // it could not absorb cleanly" refinement available. `apply_position_fill` prorates
-            // BOTH `margin_release` and `vq_fraction` by the closed fraction, so the shortfall is
-            // LINEAR in the quantity closed — if the whole position is short at this price, every
-            // slice of it is short in the same proportion. Shrinking `take` buys nothing beyond
-            // the dust `adl_fill` already handles. The real knob is the eligibility rule itself.
+            // ⚠️ Note for whoever revisits this: `apply_position_fill` prorates BOTH
+            // `margin_release` and `vq_fraction` by the closed fraction, so if the whole position
+            // is short at this price, every slice of it is short in the same proportion — but an
+            // insolvent slice draws its gap from the position's REMAINING margin first, and only
+            // what the whole silo cannot cover is bad debt. So the fund's bill is not linear in
+            // the quantity closed: a fill that closes this holder ENTIRELY books its whole
+            // shortfall at this price to the fund; one that closes only PART of it (a smaller
+            // residual, or the budget running out) charges the fund nothing until the slice's
+            // gap exceeds the rest's silo — the holder pays its own slice's loss out of the rest,
+            // which is left with less than its pro-rata silo (the loser-side twin of this is
+            // D2-continuation-1, `isolated_adl_price`). Shrinking `take` does not make the loss
+            // smaller, only moves it: onto the rest's silo, or onto the next holder in the queue.
+            // The real knob is the eligibility rule itself.
             //
             // `BadDebtPolicy` is the seam if the exclusion comes back.
             fallback.push((user, eq_mark as i128, None));
@@ -968,8 +981,12 @@ enum BadDebtPolicy {
     /// insolvent one, less what the rest's silo covers when the fill closes only part of it
     /// (`apply_position_fill`). The WINNER is still held to zero bad debt.
     LoserOnly,
-    /// Last resort, and only against a counterparty that is ALREADY bankrupt at the mark. See
-    /// `run_adl`'s fallback tier for why that restriction is the whole argument.
+    /// Last resort: the FALLBACK tier, filled only once every clean candidate is spent. That is a
+    /// counterparty ALREADY bankrupt at the mark, or one solvent there but short at the fill
+    /// price: an ISOLATED holder whose equity there is negative (against an insolvent long's `p_b`
+    /// above the mark, or — every ADL price held at `maxPrice` — a long selling at a capped price
+    /// below it), or a CROSSED one whose `E` cannot carry the fill (held to `min(E, 0)`). See
+    /// `run_adl`'s fallback tier: the first is the easy half, the second the deliberate weak part.
     BothSides,
 }
 
