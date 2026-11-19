@@ -5272,10 +5272,12 @@ fn update_market_cannot_zero_the_mark_price() {
 //   is written off, and `E` rises by the uncovered amount. The fund is seeded far past anything
 //   these scenarios can produce, and the test asserts the event never fires.
 // * **Funding**, which is not an exact zero-sum transfer between longs and shorts here: each
-//   position settles against the index on its own first touch, with its own floored payment, so
-//   the two sides' payments need not net to zero at any instant. (It no longer touches the
-//   insurance fund — a charge lands on `pos.margin` whole, possibly as a debt.) Disabled in this
-//   market.
+//   position settles against the index on its own first touch, rounding its own payment toward
+//   −∞ (a payer pays the ceiling, a receiver gets the floor), so the two sides' payments need not
+//   net to zero at any instant — and once every position is settled, `E` has only ever FALLEN, by
+//   the dust (review Q5; `usdc_custody::funding_rounding_burns_dust_into_custody_and_never_mints`).
+//   (It no longer touches the insurance fund — a charge lands on `pos.margin` whole, possibly as a
+//   debt.) Disabled in this market.
 // * **`transferToPerp` / `transferFromPerp`**, which are genuine external flows. Not used here.
 #[cfg(test)]
 mod value_conservation;

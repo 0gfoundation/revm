@@ -3071,7 +3071,12 @@ sol! {
         // operation that touches the position after a funding epoch boundary (a fill, a margin
         // add/remove, a liquidation), never on a schedule of its own.
         //
-        // `amount` is the FULL signed payment (positive = the position received). Where it lands
+        // `amount` is the FULL signed payment (positive = the position received): the exact
+        // amount rounded toward −∞ (`math::calc_funding_payment`, review Q5) — a payer pays it
+        // rounded UP, a receiver receives it rounded DOWN, a whole-unit amount is exact. So funding
+        // never mints: over a fully settled epoch Σ `amount` ≤ 0, short of zero by less than one
+        // unit per non-exact settlement — dust that stays in USDC custody, attributed to no one.
+        // A receiver owed less than one unit gets 0 and no event. Where it lands
         // depends on the position's margin type IN FORCE (cross P2):
         // * ISOLATED — it is EXACTLY the change in `P[].iw`: the whole payment lands on the
         //   position's margin, which a charge may drive NEGATIVE (a debt that lowers equity and is

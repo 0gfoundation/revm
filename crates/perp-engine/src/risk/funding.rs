@@ -13,6 +13,17 @@
 //! still refuse — so the entire accrual is realised against the `amount` that was
 //! actually held over the period.
 //!
+//! Rounding (review Q5, owner 2026-11-19): each position rounds its OWN payment, at its own
+//! touch, toward −∞ (`calc_funding_payment`) — a payer pays the exact amount rounded UP, a
+//! receiver receives it rounded DOWN, a whole-unit amount is untouched. So the two sides of an
+//! epoch are NOT zero-sum to the unit: Σ paid ≥ Σ received, by less than one unit per non-exact
+//! settlement, and that dust stays unattributed in USDC custody (`custody ≥ claims`, never the
+//! reverse — `risk::tests::usdc_custody::funding_rounding_burns_dust_into_custody_and_never_mints`).
+//! It is not credited to the insurance fund: no single settlement can tell its share. Every
+//! reader of a pending amount — the account views, liquidation and ADL equity — prices it through
+//! [`pending_funding_payment`] / [`pending_funding_of`], so it agrees with the settlement to the
+//! unit.
+//!
 //! Settlement direction (matches `calc_funding_payment`'s sign): for an ISOLATED position
 //! funding settles against the POSITION, never the account-global perp wallet (a CROSSED one is
 //! the opposite — see the section below). The signed payment is
@@ -154,9 +165,9 @@ impl PendingFunding {
 /// payment [`compute_funding_settlement`] would add to `pos.margin`. Zero for a flat position or
 /// one already anchored at `index`.
 ///
-/// The ONE place the pending amount is derived. Exposed so a reader that must judge a position's
-/// EFFECTIVE equity without settling it — ADL ranking its counterparties — computes exactly the
-/// number the settlement will apply.
+/// The ONE place the pending amount is derived (rounded toward −∞, see the module docs). Exposed
+/// so a reader that must judge a position's EFFECTIVE equity without settling it — ADL ranking its
+/// counterparties — computes exactly the number the settlement will apply.
 pub(crate) fn pending_funding_payment(
     index: i128,
     pos: &PerpPosition,

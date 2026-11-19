@@ -91,8 +91,9 @@ pub struct PerpPosition {
     #[serde(rename = "lv")]
     pub leverage: u64,
     /// Cumulative funding index at this position's last funding settlement.
-    /// Funding owed = `amount × (market cumulative_funding_index − this)`,
-    /// settled lazily on every position-touching op. See the `funding` module.
+    /// Funding owed = `amount × (market cumulative_funding_index − this)`, scaled to quote units
+    /// and rounded toward −∞ by [`crate::math::calc_funding_payment`], settled lazily on every
+    /// position-touching op. See the `funding` module.
     #[serde(default, rename = "fi")]
     pub last_funding_index: i128,
     // ── Per-side resting-order aggregates = Binance's `Bid` / `Ask` (catalog #A) ─────────────

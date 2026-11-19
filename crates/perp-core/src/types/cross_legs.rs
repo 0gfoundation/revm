@@ -9,7 +9,8 @@ use crate::types::{MarginType, PerpPosition, MAX_USER_MARKETS};
 /// One entry of [`CrossLegs`]: a CROSSED, non-zero position's state — exactly the fields the cross
 /// health terms are priced from, with the types [`PerpPosition`] gives them: `N = trunc(amount ·
 /// mark)`, `uPnL = N + v_quote_balance`, `MM` at `|N|`, and the pending funding
-/// `amount × (index − last_funding_index)`.
+/// `amount × (index − last_funding_index)` (scaled and rounded toward −∞ by
+/// [`crate::math::calc_funding_payment`]).
 ///
 /// Stored only inside a [`CrossLegs`] blob, in its packed layout (see there).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

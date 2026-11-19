@@ -931,7 +931,8 @@ pub fn save_position_reservation_only<H: PerpHost>(
 /// [`save_position_reservation_only`] for the one flush that may also have RE-ANCHORED the
 /// position's funding index: a match's silent route (`trading::settlement` — a user who published
 /// nothing and whose `amount`, `margin` and account are as stored), after `get_or_load` settled
-/// funding with a payment that truncated to ZERO. Nothing published moves, so the route stays
+/// funding with a payment that rounded to ZERO (a receiver's sub-unit credit: funding rounds
+/// toward −∞, so a payer's never does). Nothing published moves, so the route stays
 /// silent, but `last_funding_index` did, and a CROSSED non-zero position's leg
 /// (`types::CrossLegs`, cross P4) carries it: it is mirrored here — silently too, the leg being no
 /// published balance. Only a non-zero position CROSSED in force has a leg, and the leg is written
