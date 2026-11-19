@@ -209,7 +209,8 @@ fn wallet_of(ctx: &mut TestCtx, user: Address) -> i64 {
 /// share. That equality is not general — a later pass that fills the rest below that share's
 /// bankruptcy price books the gap as insurance-fund bad debt, which one uncapped close would have
 /// netted against the surplus the tick's pass released to the wallet (second-round review
-/// q6-progress-1, an open owner decision; see `liquidate_position`).
+/// q6-progress-1 — accepted by the owner as a known issue on 2026-11-19; see
+/// `liquidate_position`).
 ///
 /// At $90: equity `2_660_000_000 − 1_330_000_000 = 1_330_000_000` < MM `133·90e6/6 =
 /// 1_995_000_000`. The tick's pass fills 128 makers and stops on the cap with 5 live bids left:
