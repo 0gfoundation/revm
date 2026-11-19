@@ -34,7 +34,10 @@ pub(crate) struct LiquidationCloseOutcome {
     /// rest goes to ADL like one the book could not take. Otherwise such "phantom" orders — accepted
     /// at placement, refused at every fill — could be restuffed to keep a liquidation deferring
     /// pass after pass with nothing closed (Q6 review). With progress required, every deferral
-    /// closes at least one lot against the book.
+    /// closes at least one lot against the book. Nothing stops them resting (the per-open guards
+    /// judge the fill, not the rest: the TODO in `resting::rest_in_book`), so they can still make a
+    /// capped pass fill nothing — ADL'd in that pass, the pre-Q6 outcome — or hold a deferred
+    /// liquidation to one lot per pass.
     pub(crate) maker_cap_deferred: bool,
 }
 

@@ -326,13 +326,13 @@ pub fn position_value_fits_i64(
 /// The position-size bound of `market` (Q7): a position of `amount` fits it when it is worth at
 /// most `i64::MAX` quote units at `max(maxPrice, mark_price)`.
 ///
-/// Every OPENING fill — taker and maker — is held to it (and every resting order that can open,
-/// filled in full at its own price), and `updateMarket` refuses to raise `maxPrice` past an open
-/// position that would break it. Every price a position is later valued at, or filled at through
-/// the book, is at or below that ceiling: the mark is clamped to `maxPrice` on each oracle update
-/// (the `max` covers the stored mark an `updateMarket` that LOWERS `maxPrice` leaves above it until
-/// the next update), and no book fill executes above `maxPrice` ([`market_band_bounds`]; an
-/// ISOLATED ADL fill at a bankruptcy price can, see there). So no valuation of a position's
+/// Every OPENING fill — taker and maker — is held to it (an order whose fill would pass it still
+/// rests, and is cancelled at its first touch), and `updateMarket` refuses to raise `maxPrice` past
+/// an open position that would break it. Every price a position is later valued at, or filled at
+/// through the book, is at or below that ceiling: the mark is clamped to `maxPrice` on each oracle
+/// update (the `max` covers the stored mark an `updateMarket` that LOWERS `maxPrice` leaves above
+/// it until the next update), and no book fill executes above `maxPrice` ([`market_band_bounds`];
+/// an ISOLATED ADL fill at a bankruptcy price can, see there). So no valuation of a position's
 /// NOTIONAL — at the mark, or as the summed closing value of a liquidation that takes it through
 /// the book in one pass — can leave the `i64` range the sweep would otherwise halt on.
 ///

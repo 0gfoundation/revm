@@ -721,9 +721,10 @@ sol! {
         /// `liquidationFeeRateBps`: a rate on the NOTIONAL closed (⚠️ ABI CHANGE, cross P3 — see
         /// `addMarket`).
         ///
-        /// `maxPrice` bounds positions as well as prices: every opening order and fill keeps the
-        /// position worth at most `int64` max quote units at `max(maxPrice, mark)` (`placeOrder`'s
-        /// `-2027`). So RAISING `maxPrice` past what an open position can be worth there reverts
+        /// `maxPrice` bounds positions as well as prices: every opening fill keeps the position
+        /// worth at most `int64` max quote units at `max(maxPrice, mark)` (`placeOrder`'s `-2027`;
+        /// a resting order whose fill would pass it is cancelled at its first touch, reason 2). So
+        /// RAISING `maxPrice` past what an open position can be worth there reverts
         /// `updateMarket: maxPrice too high for an open position (its value there exceeds
         /// i64::MAX)`, nothing written; lowering it is always accepted. After a lowering, no BOOK
         /// fill executes above the new `maxPrice` — an order left resting above it can no longer
@@ -777,8 +778,12 @@ sol! {
         /// NOTHING (every maker it reached was refused at its fill and cancelled) is ADL'd in the
         /// same pass, as one the book cannot take. Each deferred pass takes at least 128 resting
         /// orders off the book AND closes at least one lot, so the loop ends — at a fixed book, and
-        /// however the book is restuffed, within `|position|` deferred passes (a restuffed book
-        /// can hold it to one lot per pass).
+        /// however the book is restuffed, within `|position|` deferred passes. Orders refused at
+        /// every fill can be rested at will — an order is not judged against its fill's per-open
+        /// guards (or an isolated maker's K9) when it rests, see `placeOrder` — so such "phantom"
+        /// makers can still make a capped pass fill nothing (its rest is then ADL'd in that pass,
+        /// the outcome before the cap deferred anything) or hold a deferred liquidation to one lot
+        /// per pass.
         ///
         /// # What it does NOT do
         ///
@@ -1167,10 +1172,11 @@ sol! {
         /// Tier 0's `maxLeverage` becomes the market's `setLeverage` cap. Existing positions
         /// are NOT re-checked: an over-levered position keeps running and is only refused
         /// when it next tries to OPEN. Nor are stored leverages: a FLAT user whose leverage
-        /// is above the new tier-0 cap is refused on every open too, and `getSymbolConfig`
-        /// reports `maxNotionalValue = 0` for them until `setLeverage` lowers it (a flat user or
-        /// a CROSSED position may; an open ISOLATED position cannot lower its leverage, `-4161`,
-        /// and can only reduce).
+        /// is above the new tier-0 cap is refused on every opening fill too (a crossing order
+        /// reverts; an opening order that rests is accepted and cancelled at its first touch,
+        /// `OrderCancelled` reason 2), and `getSymbolConfig` reports `maxNotionalValue = 0` for
+        /// them until `setLeverage` lowers it (a flat user or a CROSSED position may; an open
+        /// ISOLATED position cannot lower its leverage, `-4161`, and can only reduce).
         ///
         /// ⚠️ ABI CHANGE (cross P0): `maintMarginRatesPpm` and then `notionalCap` were APPENDED as
         /// parameters, so the SELECTOR moved `0x34364f71` → `0x643093a5`. The old three-argument
@@ -1287,16 +1293,17 @@ sol! {
         ///                     uncapped table, the same value `getMarginTiers.notionalCaps`
         ///                     reports for it. **`0` MEANS NONE**: no tier admits `leverage` at
         ///                     all — a leverage set before `setMarginTiers` lowered tier 0's
-        ///                     `maxLeverage` under it (a flat user keeps it too). Every open is
-        ///                     then refused until `setLeverage` brings it back under the cap —
-        ///                     a crossing order at its fill, a resting one when it rests
-        ///                     (`placeOrder: leverage exceeds the margin tier for this position
-        ///                     size`; an order rested before the table changed is cancelled at
-        ///                     its first touch, reason 2) — and `leverage` above still reports the
-        ///                     stored value, which is what the chain applies. Every market today ships the single default
-        ///                     tier `{0, 3}`, so every market today returns `type(uint64).max` at
-        ///                     every legal leverage; the field only becomes informative once
-        ///                     `setMarginTiers` installs a real table.
+        ///                     `maxLeverage` under it (a flat user keeps it too). Every opening
+        ///                     FILL is then refused until `setLeverage` brings it back under the
+        ///                     cap: a crossing order reverts (`placeOrder: leverage exceeds the
+        ///                     margin tier for this position size`), and an opening order that
+        ///                     RESTS is accepted — it is not judged when it rests — and is
+        ///                     cancelled at its first touch (`OrderCancelled` reason 2,
+        ///                     MakerInsolvent). `leverage` above still reports the stored value,
+        ///                     which is what the chain applies. Every market today ships the
+        ///                     single default tier `{0, 3}`, so every market today returns
+        ///                     `type(uint64).max` at every legal leverage; the field only becomes
+        ///                     informative once `setMarginTiers` installs a real table.
         ///                     ⚠️ ENCODING CHANGE (test review Q13): unbounded was `0`, and a
         ///                     leverage no tier admits had no encoding (it reported a band edge,
         ///                     or `0` = unbounded). Update any reader of this word.
@@ -1541,15 +1548,13 @@ sol! {
         ///     notional's tier caps leverage below the account's leverage for the market (as after
         ///     a `setMarginTiers` that lowered it — `getSymbolConfig` then reports
         ///     `maxNotionalValue = 0` for a flat account).
-        /// A taker's opening fill is judged at the mark. An order that can open and would REST is
-        /// judged too, write-clean and for the whole order, as if filled in full at its OWN price —
-        /// not at the mark its fill will be judged at. So a resting order can still be refused at
-        /// its fill, and is then cancelled when the walk meets it (`OrderCancelled` reason 2) and
-        /// the walk goes on: when the mark differs from its price (a bid below the mark is valued
-        /// higher at its fill), when the account's leverage was raised after it rested, or when
-        /// the position or the table changed. A pure reduce, and a reduce-only order, is never
-        /// refused by either; an order that would flip the position is judged on the side it
-        /// opens.
+        /// Both judge an opening FILL, at the mark: a taker's opening fill reverts the whole order;
+        /// a maker's is refused, and its order cancelled when the walk meets it (`OrderCancelled`
+        /// reason 2, MakerInsolvent), and the walk goes on. An order is NOT judged when it rests:
+        /// an opening order its fill would refuse is accepted, rests, and is cancelled at its first
+        /// touch (reason 2). (A rest-time check is a TODO, to be designed with multi-tier leverage
+        /// tables.) A pure reduce, and a reduce-only order, is never refused by either; an order
+        /// that would flip the position is judged on the side it opens.
         function placeOrder(uint64 marketId, uint8 side, uint64 price, uint64 quantity, uint8 orderType, uint8 tif, bytes16 clientOrderId, uint8 flags) external returns (bytes32 orderId);
         /// Cancel an open order (caller must be the owner).
         /// marketId is accepted for ABI compatibility but ignored — orders are looked up globally by orderId.
@@ -1985,8 +1990,10 @@ sol! {
         /// liquidity for it — and is closed against the book by `drainDeferredWork` (the call sets
         /// the market's deferred-work flag), the next tick or a repeated `liquidate`, each
         /// re-judging maintenance first; a capped close that filled nothing (every maker it reached
-        /// refused at its fill) is ADL'd at once. A rest left because ADL ran out of budget sets
-        /// the flag too. Each pass emits its own `Liquidation`.
+        /// refused at its fill) is ADL'd at once. Orders refused at every fill can be rested at will
+        /// (see `drainDeferredWork`), so such makers can still make a pass fill nothing (ADL'd at
+        /// once) or hold the close to one lot per pass. A rest left because ADL ran out of budget
+        /// sets the flag too. Each pass emits its own `Liquidation`.
         ///
         /// An ISOLATED position is refused, with no write, when it is at or above its own
         /// maintenance (`liquidate: position is above maintenance margin`) and when it cannot be
