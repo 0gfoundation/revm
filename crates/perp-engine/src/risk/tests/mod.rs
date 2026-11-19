@@ -5339,6 +5339,12 @@ mod band_expiry;
 // and no fill executes above `maxPrice` — so no valuation the liquidation sweep makes can fault.
 mod position_bound;
 
+// ── An ISOLATED ADL fill is held at `maxPrice` (owner decision 2026-11-19, D2) ──────────────────
+//
+// `min(its price, maxPrice)`: the winner never pays above `maxPrice`, and what a long's own price
+// would have taken past it is the loser's shortfall, absorbed by the insurance fund.
+mod adl_max_price;
+
 // ── An opening REST is not held to the per-open guards of its fill (TODO) ──────────────────────
 //
 // The tier guard and the position bound refuse an opening fill; an order they would refuse still
