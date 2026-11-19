@@ -1325,7 +1325,6 @@ pub(super) fn raise_rest_refusal(outcome: RestOutcome) -> Result<(), PerpError> 
             Err(perp_err(insufficient_margin_reject(cross)))
         }
         RestOutcome::RefusedUnderCrossMaintenance => Err(perp_err(CROSS_MAINTENANCE_REJECT)),
-        RestOutcome::RefusedOpenGuard(reason) => Err(perp_err(reason)),
     }
 }
 

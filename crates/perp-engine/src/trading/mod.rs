@@ -13,7 +13,6 @@ mod settlement;
 pub(crate) use liquidation_close::execute_liquidation_market_order;
 pub(crate) use settlement::{
     apply_position_fill, OpeningMarginFunding, CROSS_MAINTENANCE_REJECT, ISOLATED_SILO_CASH_REJECT,
-    POSITION_LIMIT_REJECT, TIER_LEVERAGE_REJECT,
 };
 use settlement::{MakerFillOutcome, TakerSettlement};
 
