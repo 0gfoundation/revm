@@ -27,7 +27,9 @@ use crate::{
 /// unconditional invariant. No mint: the loser closes at a price where it realizes no bad
 /// debt, and each opposite holder that can absorb at that price without going insolvent
 /// gives up exactly its share of the shortfall. The fund is billed only for what no
-/// representable price can push onto the opposite side (`p_b == 0`) and for fallback-tier
+/// representable price can push onto the opposite side (`p_b == 0`), for what an ISOLATED long
+/// loses below its own price when that price is held at `maxPrice` (no isolated ADL fill executes
+/// above it, owner decision 2026-11-19 — see [`isolated_adl_price`]), and for fallback-tier
 /// winners already short at the fill price. Both legs of every fill use the SAME
 /// single-floored `calc_value(P_b, take)`, so Σ vQuote and Σ amount are conserved (a real
 /// trade, not a synthetic close).
@@ -118,7 +120,7 @@ pub(crate) fn run_adl<H: PerpHost>(
         };
         (p.max(1), BadDebtPolicy::Forbid)
     } else {
-        isolated_adl_price(&loser_pos, mark_price, bd, pd)?
+        isolated_adl_price(&loser_pos, mark_price, market.max_price, bd, pd)?
     };
     run_adl_fills(
         context,
@@ -133,10 +135,12 @@ pub(crate) fn run_adl<H: PerpHost>(
 }
 
 /// The fill price and loser policy of an ISOLATED loser's ADL: the mark for a solvent residual,
-/// its bankruptcy price for an insolvent one (see the body).
+/// its bankruptcy price for an insolvent one — either held at `max_price`, the market's `maxPrice`
+/// (see the body).
 fn isolated_adl_price(
     loser_pos: &crate::types::PerpPosition,
     mark_price: u64,
+    max_price: u64,
     bd: u32,
     pd: u32,
 ) -> Result<(u64, BadDebtPolicy), PerpError> {
@@ -224,6 +228,46 @@ fn isolated_adl_price(
             p_b
         }
     };
+    // ── …HELD AT `maxPrice` (owner decision 2026-11-19, D2) ──────────────────────────────────────
+    //
+    // Every BOOK fill is held at or below `maxPrice` (`math::market_band_bounds`, Q7), and so is a
+    // cross episode's ADL at its bankruptcy price (clamped into that band, whose upper edge is
+    // `maxPrice`). This price is held at `maxPrice` too: `min(price, maxPrice)`, the cap alone, not
+    // the band — the band would also move ordinary ADLs (a crash leaves a long's `p_b` more than the
+    // band above the mark, a short's below its lower edge), and the decision was the cap. (A cross
+    // ADL at the MARK is clamped by neither; see `market_band_bounds`.)
+    //
+    // Where the price above can exceed `maxPrice` (every oracle update holds the mark in
+    // `[1, maxPrice]`):
+    //
+    //   * an insolvent LONG — its `p_b` sits ABOVE the mark, and above `maxPrice` once it is past
+    //     it: a long whose entry basis sits above a `maxPrice` an `updateMarket` lowered since, or
+    //     one whose funding debt (a negative `margin`) lifted `p_b` past an entry near `maxPrice`;
+    //   * ANY residual, long or short, while the stored mark sits above a `maxPrice` an
+    //     `updateMarket` has just lowered (the mark moves only on the next `updateIndexPrice`;
+    //     `liquidate()` and `drainDeferredWork` run on the stored mark in between): a solvent one
+    //     at that mark, an insolvent short at a `p_b` between `maxPrice` and the mark.
+    //
+    // Outside that window a SHORT is never capped: its price is the mark or a `p_b` below it (or 1).
+    //
+    // Who pays the difference: the WINNER now trades at `maxPrice`, never above it. A capped SHORT
+    // loser buys back below its own price, so it keeps more equity, and its policy stands (`Forbid`:
+    // the cap only takes it further from bad debt; a price-1 short is never capped, `maxPrice ≥
+    // tickSize ≥ 1`). A capped LONG sells below its own price, and what that leaves it short —
+    // `(p_b − maxPrice) × take` for an insolvent one, up to the fill's rounding; for one solvent at
+    // the mark in the window, whatever its equity at `maxPrice` falls below zero, if it does — is the
+    // LOSER's shortfall: it fills under `LoserOnly`, `adl_fill` reports the shortfall as its bad debt,
+    // and the end of `run_adl_fills` routes that like every isolated close's deficit
+    // (`absorb_bad_debt_into_insurance_fund`: the fund, then `InsuranceFundDepleted` for what it
+    // cannot cover). Before the cap the winner absorbed that gap by paying `p_b` (second-round review
+    // band-iso-adl-4). Decided here, before `run_adl_fills` writes anything; every winner's screening
+    // (`eq_fill`, a CROSSED winner's slippage) then judges it at this capped price.
+    if fill_price > max_price {
+        if loser_pos.amount > 0 {
+            loser_policy = BadDebtPolicy::LoserOnly;
+        }
+        return Ok((max_price, loser_policy));
+    }
     Ok((fill_price, loser_policy))
 }
 
@@ -428,7 +472,8 @@ fn run_adl_fills<H: PerpHost>(
         .ok_or_else(|| perp_err("adl: Σ position margin underflow"))?;
     let mut did_any = false;
     // Shortfalls this ADL could not avoid: the loser's when `p_b == 0` (sub-unit or funding-debt
-    // regime), and a fallback-tier winner's under `BothSides`. Zero on every ordinary fill.
+    // regime) or when `maxPrice` held a long's price below its own (`isolated_adl_price`), and a
+    // fallback-tier winner's under `BothSides`. Zero on every ordinary fill.
     // Absorbed once after the loop rather than per fill, so the fund takes one write and one event
     // for the whole ADL.
     let mut bad_debt: u64 = 0;
@@ -674,8 +719,9 @@ fn run_adl_fills<H: PerpHost>(
         storage::clear_account_snapshot_mark(context, loser);
     }
 
-    // The `p_b == 0` loser shortfall and any fallback-tier winner shortfall, absorbed ONCE for the
-    // whole ADL rather than per fill, so the fund takes one write and emits one row. Zero on every
+    // The `LoserOnly` loser shortfall (`p_b == 0`, or a long's price held at `maxPrice`) and any
+    // fallback-tier winner shortfall, absorbed ONCE for the whole ADL rather than per fill, so the
+    // fund takes one write and emits one row. Zero on every
     // fill accepted under `Forbid` (`adl_fill` reports bad debt only where `BadDebtPolicy` allows
     // it), and this is a QUOTE claim only: the position itself went to the winner, so Σ amount is
     // untouched. It is routed AFTER the loser's `clear_account_snapshot_mark` above on purpose — it
@@ -851,7 +897,9 @@ enum BadDebtPolicy {
     /// `p_b == 0` — no representable price closes the LOSER cleanly (the sub-unit regime, or a
     /// short whose funding debt exceeds its entry proceeds), so its gap goes to the fund: dust
     /// below `calc_value(1, take)` in the first case, `|credit|` pro rata plus that dust in the
-    /// second. The WINNER is still held to zero bad debt.
+    /// second. And an ISOLATED LONG whose price was held at `maxPrice` (`isolated_adl_price`): what
+    /// selling there instead of at its own price leaves it short — `(p_b − maxPrice) × take` for an
+    /// insolvent one. The WINNER is still held to zero bad debt.
     LoserOnly,
     /// Last resort, and only against a counterparty that is ALREADY bankrupt at the mark. See
     /// `run_adl`'s fallback tier for why that restriction is the whole argument.
@@ -973,6 +1021,68 @@ fn adl_fill(
 }
 
 // `emit_position_changed` lives in `crate::events` — one derivation for all seven emit sites.
+
+#[cfg(test)]
+mod isolated_adl_price_tests {
+    use super::{isolated_adl_price, BadDebtPolicy};
+
+    /// `(amount, vQuote, margin)` 10 lots entered at $100 on a $500 silo, at `bd = 0`, `pd = 2`:
+    /// the long's bankruptcy price is $50, the short's $150.
+    fn pos(amount: i64, v_quote_balance: i64, margin: i64) -> crate::types::PerpPosition {
+        crate::types::PerpPosition {
+            amount,
+            v_quote_balance,
+            margin,
+            ..crate::margin::margin_type::never_set_position()
+        }
+    }
+
+    fn price(p: &crate::types::PerpPosition, mark: u64, max_price: u64) -> (u64, &'static str) {
+        let (price, policy) = isolated_adl_price(p, mark, max_price, 0, 2).unwrap();
+        let policy = match policy {
+            BadDebtPolicy::Forbid => "Forbid",
+            BadDebtPolicy::LoserOnly => "LoserOnly",
+            BadDebtPolicy::BothSides => "BothSides",
+        };
+        (price, policy)
+    }
+
+    /// D2 (owner decision 2026-11-19): the price — the mark for a residual solvent there, `p_b`
+    /// for an insolvent one, 1 for a short with no representable `p_b` — is held at `maxPrice`. A
+    /// LONG held below its own price fills under `LoserOnly` (its shortfall is the fund's); a short
+    /// held there keeps `Forbid` (the cap only adds to its equity). At or under `maxPrice` nothing
+    /// changes.
+    #[test]
+    fn the_price_is_held_at_max_price_and_a_capped_long_may_leave_its_gap() {
+        let long = pos(10, -1_000_000_000, 500_000_000);
+        let short = pos(-10, 1_000_000_000, 500_000_000);
+        for (p, mark, max_price, want) in [
+            // An insolvent long: `p_b` $50, above the mark.
+            (&long, 3_500, 1_000_000, (5_000, "Forbid")),
+            (&long, 3_500, 5_000, (5_000, "Forbid")),
+            (&long, 3_500, 4_999, (4_999, "LoserOnly")),
+            (&long, 3_500, 4_000, (4_000, "LoserOnly")),
+            // A solvent long at a stored mark above a just-lowered `maxPrice`.
+            (&long, 10_000, 10_000, (10_000, "Forbid")),
+            (&long, 10_000, 9_000, (9_000, "LoserOnly")),
+            // An insolvent short: `p_b` $150, below the mark — capped only when the mark is above
+            // `maxPrice` too.
+            (&short, 15_500, 15_500, (15_000, "Forbid")),
+            (&short, 20_000, 16_000, (15_000, "Forbid")),
+            (&short, 20_000, 12_000, (12_000, "Forbid")),
+            // A solvent short in that window.
+            (&short, 10_000, 9_000, (9_000, "Forbid")),
+            (&short, 10_000, 10_000, (10_000, "Forbid")),
+        ] {
+            assert_eq!(price(p, mark, max_price), want, "{} at mark {mark}, maxPrice {max_price}", p.amount);
+        }
+        // A short with no representable `p_b` (a funding debt past its entry proceeds) fills at one
+        // price unit under `LoserOnly`, at the lowest `maxPrice` there is.
+        let indebted = pos(-10, 100_000_000, -200_000_000);
+        assert_eq!(price(&indebted, 10_000, 1), (1, "LoserOnly"));
+        assert_eq!(price(&indebted, 10_000, 1_000_000), (1, "LoserOnly"));
+    }
+}
 
 #[cfg(test)]
 mod adl_rank_tests {
